@@ -2,18 +2,276 @@
 
 import logging
 import boto3
-from typing import Dict, List, Optional, Set, Any, Tuple
+import json
+from typing import Dict, List, Optional, Set, Any, Tuple, Iterator, Union, Sequence, Callable, Literal
 from botocore.client import BaseClient, Config
 
 from langchain_aws import ChatBedrockConverse
+from langchain_aws.chat_models.bedrock_converse import _messages_to_bedrock, _snake_to_camel_keys, _parse_response, _parse_stream_event
 from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.language_models import LanguageModelInput
+from langchain_core.messages import BaseMessage
+from langchain_core.outputs import ChatResult, ChatGeneration, ChatGenerationChunk
+from langchain_core.runnables import Runnable
+from langchain_core.tools import BaseTool
+from langchain_core.utils.pydantic import TypeBaseModel
 
-from aki.config import get_env_file
-from aki.config import get_config_value
+from ...config import get_env_file, get_config_value
 from ..capabilities import ModelCapability
 from .base import LLMProvider
+from .. import token_counter
 
 logger = logging.getLogger(__name__)
+
+class CachePointInjector:
+    """Helper to inject cache points into messages for Bedrock models."""
+    
+    @staticmethod
+    def add_cache_point_to_messages(messages: List[Dict], system: List[Dict], max_cache_points: int = 3) -> tuple:
+        """Add cachePoint to messages based on size and importance.
+        
+        Args:
+            messages: List of message dictionaries from Bedrock
+            system: Optional system message (string or dict)
+            max_cache_points: Maximum number of cache points to add (default: 3)
+            
+        Returns:
+            Tuple of (modified messages list, modified system)
+        """
+        # Prepare list of message info including system if present
+        message_info = []
+        
+        # Add system message to consideration if it exists
+        system_token_size = CachePointInjector._estimate_token_size(system[0])
+
+        # Add system to message info with special index -1
+        message_info.append({"index": -1, "size": system_token_size, "is_system": True})
+        
+        # Process regular messages
+        for i, msg in enumerate(messages):
+            role = msg.get("role", "")
+            is_system = (role == "system")
+            
+            # Estimate token size using tiktoken
+            token_size = CachePointInjector._estimate_token_size(msg)
+            message_info.append({"index": i, "size": token_size, "is_system": is_system})
+        
+        # Sort messages by priority (system first, then by size)
+        message_info.sort(key=lambda x: (-int(x["is_system"]), -x["size"]))
+        
+        # Determine which messages to add cache points to (up to max_cache_points)
+        cache_indices = set()
+        for info in message_info[:max_cache_points]:
+            # Only add cache point if message is large enough
+            min_size = 1500
+            if info["size"] >= min_size:
+                cache_indices.add(info["index"])
+        
+        # Process system message if it's selected for caching
+        modified_system = system
+        if -1 in cache_indices and system is not None:
+            # Only convert to dict and add cache point if it's a string
+            if "cachePoint" not in modified_system:
+                modified_system.append({"cachePoint": {"type": "default"}})
+        
+        # Add cache points to selected regular messages
+        result = []
+        for i, msg in enumerate(messages):
+            new_msg = dict(msg)  # Create a copy
+            
+            # Add cache point if this message is selected
+            if i in cache_indices:
+                new_msg = CachePointInjector._add_cache_point(new_msg)
+                logger.debug(f"Added cache point to message with role: {new_msg.get('role', 'unknown')}")
+            
+            result.append(new_msg)
+        
+        return result, modified_system
+    
+    @staticmethod
+    def _estimate_token_size(msg: Dict) -> int:
+        """Estimate token size of a message."""
+        # Extract the content - handle different formats
+        if "content" not in msg:
+            if "text" in msg:
+                content = msg["text"]
+            else:
+                return 0
+        else:
+            content = msg["content"]
+        
+        # If content is a string, count tokens directly
+        if isinstance(content, str):
+            return token_counter.str_token_counter(content)
+        
+        # If content is a list of content blocks, sum up their sizes
+        elif isinstance(content, list):
+            total = 0
+            for item in content:
+                if isinstance(item, dict) and "text" in item:
+                    total += token_counter.str_token_counter(item["text"])
+                elif isinstance(item, dict):
+                    # For non-text blocks, estimate based on JSON representation
+                    total += token_counter.str_token_counter(json.dumps(item))
+                elif isinstance(item, str):
+                    total += token_counter.str_token_counter(item)
+            return total
+        
+        # Default fallback - convert to string and count
+        return token_counter.str_token_counter(json.dumps(content))
+    
+    @staticmethod
+    def _add_cache_point(msg: Dict) -> Dict:
+        """Add a cache point to a single message."""
+        # Make a deep copy
+        new_msg = dict(msg)
+        
+        # Handle different content formats
+        if "content" not in new_msg:
+            new_msg["content"] = []
+        elif isinstance(new_msg["content"], str):
+            # Convert string content to list with text item
+            new_msg["content"] = [{"text": new_msg["content"]}]
+        elif not isinstance(new_msg["content"], list):
+            # Convert other content to list
+            new_msg["content"] = [new_msg["content"]]
+            
+        # Add cache point if not already present
+        content_list = new_msg["content"]
+        cache_point = {"cachePoint": {"type": "default"}}
+        
+        # Only add if not already present
+        if not any(isinstance(item, dict) and "cachePoint" in item for item in content_list):
+            content_list.append(cache_point)
+        
+        # Print debug info
+        logger.debug(f"Added cache point to message with role: {new_msg.get('role', 'unknown')}")
+            
+        return new_msg
+
+
+class CachingBedrockConverse(ChatBedrockConverse):
+    """ChatBedrockConverse with prompt caching support."""
+    
+    max_cache_points: int = 3  # Properly declare field for Pydantic model
+    
+    def __init__(self, **kwargs):
+        """Initialize with caching configuration.
+        
+        Args:
+            max_cache_points: Maximum number of cache points to add (default: 3)
+            All other kwargs are passed to the parent class
+        """
+        # Get max_cache_points to pass to parent class init
+        max_points = kwargs.pop("max_cache_points", 3)
+        super().__init__(**kwargs)
+        # Set the field after parent initialization
+        object.__setattr__(self, "max_cache_points", max_points)
+    
+    def bind_tools(
+        self,
+        tools: Sequence[Union[Dict[str, Any], TypeBaseModel, Callable, BaseTool]],
+        *,
+        tool_choice: Optional[Union[dict, str, Literal["auto", "any"]]] = None,
+        **kwargs: Any,
+    ) -> Runnable[LanguageModelInput, BaseMessage]:
+        """Override bind_tools to add cache point to the tools config."""
+        # Use the parent's method to format the tools and create the base model
+        model_with_tools = super().bind_tools(tools, tool_choice=tool_choice, **kwargs)
+        
+        # Get the current params to modify them
+        if hasattr(model_with_tools, "kwargs") and "toolConfig" in model_with_tools.kwargs:
+            # Add cache point to the tools list
+            if "tools" in model_with_tools.kwargs["toolConfig"]:
+                # Check if there's already a cache point
+                tools_list = model_with_tools.kwargs["toolConfig"]["tools"]
+                has_cache_point = any(
+                    isinstance(tool, dict) and "cachePoint" in tool 
+                    for tool in tools_list
+                )
+                
+                # Add cache point if needed
+                if not has_cache_point:
+                    logger.info("Adding cache point to tools configuration")
+                    tools_list.append({"cachePoint": {"type": "default"}})
+        
+        return model_with_tools
+    
+    def _generate(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        """Override _generate to add cache points to messages."""
+        # Get bedrock messages using the original function
+        bedrock_messages, system = _messages_to_bedrock(messages)
+        
+        # Inject cache points to both regular messages and system
+        bedrock_messages, system = CachePointInjector.add_cache_point_to_messages(
+            bedrock_messages,
+            system=system,
+            max_cache_points=self.max_cache_points
+        )
+        
+        # Continue with regular process - similar to parent class
+        logger.debug(f"input message to bedrock: {bedrock_messages}")
+        logger.debug(f"System message to bedrock: {system}")
+        params = self._converse_params(
+            stop=stop, **_snake_to_camel_keys(kwargs, excluded_keys={"inputSchema", "properties", "thinking"})
+        )
+        logger.debug(f"Input params: {params}")
+        logger.info("Using Bedrock Converse API to generate response with caching enabled")
+        response = self.client.converse(
+            messages=bedrock_messages, system=system, **params
+        )
+        logger.debug(f"Response from Bedrock: {response}")
+        response_message = _parse_response(response)
+        response_message.response_metadata["model_name"] = self.model_id
+        return ChatResult(generations=[ChatGeneration(message=response_message)])
+    
+    def _stream(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager = None,
+        **kwargs: Any,
+    ) -> Iterator[ChatGenerationChunk]:
+        """Override _stream to add cache points to messages."""
+        # Get bedrock messages using the original function
+        bedrock_messages, system = _messages_to_bedrock(messages)
+        
+        # Inject cache points to both regular messages and system
+        bedrock_messages, system = CachePointInjector.add_cache_point_to_messages(
+            bedrock_messages,
+            system=system,
+            max_cache_points=self.max_cache_points
+        )
+        
+        # Continue with regular process - similar to parent class
+        params = self._converse_params(
+            stop=stop, **_snake_to_camel_keys(kwargs, excluded_keys={"inputSchema", "properties", "thinking"})
+        )
+        response = self.client.converse_stream(
+            messages=bedrock_messages, system=system, **params
+        )
+        added_model_name = False
+        for event in response["stream"]:
+            if message_chunk := _parse_stream_event(event):
+                if (
+                    hasattr(message_chunk, "usage_metadata")
+                    and message_chunk.usage_metadata
+                    and not added_model_name
+                ):
+                    message_chunk.response_metadata["model_name"] = self.model_id
+                    added_model_name = True
+                generation_chunk = ChatGenerationChunk(message=message_chunk)
+                if run_manager:
+                    run_manager.on_llm_new_token(
+                        generation_chunk.text, chunk=generation_chunk
+                    )
+                yield generation_chunk
 
 
 def validate_bedrock_access(session: boto3.Session) -> bool:
@@ -209,24 +467,40 @@ class BedrockProvider(LLMProvider):
     def create_model(
         self, name: str, model: str, tools: Optional[List] = None, **kwargs
     ) -> BaseChatModel:
-        """Create a new Bedrock chat model.
+        """Create a new Bedrock chat model with optional caching.
 
         Args:
             name: A name for the model instance
             model: The Bedrock model ID
             tools: Optional list of tools for tool-calling models
-            **kwargs: Additional arguments to pass to the model
+            **kwargs: Additional arguments to pass to the model, including:
+                enable_prompt_cache (bool): Enable prompt caching if supported
+                max_cache_points (int): Maximum number of cache points to add (default: 3)
 
         Returns:
             A configured ChatBedrockConverse instance
         """
+        # Extract caching parameters
+        enable_prompt_cache = kwargs.pop("enable_prompt_cache", False)
+        max_cache_points = kwargs.pop("max_cache_points", 3)
+        
         client = self._get_client()
         model_kwargs = self._get_model_config(model, tools, **kwargs)
         model_kwargs["client"] = client
-
+        
         try:
-            llm = ChatBedrockConverse(name=name, **model_kwargs)
-
+            # Check if caching is enabled and supported
+            use_caching = (
+                enable_prompt_cache and
+                ModelCapability.PROMPT_CACHING in self._model_capabilities.get(model, set())
+            )
+            
+            if use_caching:
+                self._logger.debug(f"Creating model {model} with prompt caching enabled (max {max_cache_points} cache points)")
+                llm = CachingBedrockConverse(name=name, max_cache_points=max_cache_points, **model_kwargs)
+            else:
+                llm = ChatBedrockConverse(name=name, **model_kwargs)
+                
             # Add tools if provided and supported
             if (
                 tools
@@ -263,6 +537,7 @@ class BedrockProvider(LLMProvider):
                 ModelCapability.TOOL_CALLING,
                 ModelCapability.STRUCTURED_OUTPUT,
                 ModelCapability.EXTENDED_REASONING,
+                ModelCapability.PROMPT_CACHING,
             },
             "us.anthropic.claude-3-5-sonnet-20241022-v2:0": {
                 ModelCapability.TEXT_TO_TEXT,
@@ -275,6 +550,7 @@ class BedrockProvider(LLMProvider):
                 ModelCapability.IMAGE_TO_TEXT,
                 ModelCapability.TOOL_CALLING,
                 ModelCapability.STRUCTURED_OUTPUT,
+                ModelCapability.PROMPT_CACHING,
             },
             "us.anthropic.claude-3-5-sonnet-20240620-v1:0": {
                 ModelCapability.TEXT_TO_TEXT,

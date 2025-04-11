@@ -14,6 +14,7 @@ class ModelCapability(Enum):
     AUDIO_TO_AUDIO = auto()
     TEXT_EMBEDDING = auto()
     EXTENDED_REASONING = auto()
+    PROMPT_CACHING = auto()
 
 
 @runtime_checkable
